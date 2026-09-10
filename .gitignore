@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# HPC / containers
+slurm/
+*.sif
+
+# Raw race data (ローカル保管のみ、Git には含めない)
+datasets/raw_data/*
+!datasets/raw_data/.gitkeep
+
+# Generated datasets (data_process.py で再生成可能)
+encoded_*.csv
+datasets/encoded/
+
+# ML training outputs (学習スクリプトで再生成可能)
+catboost_info/
+model/**/*.pkl
+model/**/*.zip
+model/**/*.pt
+model/**/*.pth
+model/stacking/*.csv
