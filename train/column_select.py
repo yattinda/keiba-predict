@@ -1,13 +1,13 @@
 group_horse_ability = [
-    "性", #category
+    "性",
     "齢",
     "平均斤量",
     "着順1",
     "着順2",
     "着順3",
-    "クラス1", #category
-    "クラス2", #category
-    "クラス3", #category
+    "クラス1",
+    "クラス2",
+    "クラス3",
     "上がり1",
     "上がり2",
     "上がり3",
@@ -21,25 +21,24 @@ category_horse_ability = [
     "クラス3",
 ]
 
-# 2. 【適性・シチュエーション重視グループ】（条件マッチモデル）
 group_race_condition = [
-    "芝・ダート", #category
+    "芝・ダート",
     "距離",
-    "回り", #category
-    "馬場", #category
-    "天気", #category
-    "場id", #category
+    "回り",
+    "馬場",
+    "天気",
+    "場id",
     "クラス",
     "斤量",
     "距離差",
     "距離差1",
     "距離差2",
-    "芝・ダート1", #category
-    "芝・ダート2", #category
-    "芝・ダート3", #category
-    "馬場1", #category
-    "馬場2", #category
-    "馬場3", #category
+    "芝・ダート1",
+    "芝・ダート2",
+    "芝・ダート3",
+    "馬場1",
+    "馬場2",
+    "馬場3",
 ]
 
 category_race_condition = [
@@ -48,30 +47,29 @@ category_race_condition = [
     "馬場",
     "天気",
     "場id",
-    "芝・ダート1", 
-    "芝・ダート2", 
-    "芝・ダート3", 
+    "芝・ダート1",
+    "芝・ダート2",
+    "芝・ダート3",
     "馬場1",
     "馬場2",
     "馬場3",
 ]
 
-# 3. 【人間・バイアス重視グループ】（人間＆オッズモデル）
 group_human_bias = [
-    "騎手", #category
+    "騎手",
     "オッズ",
     "人気",
-    "馬番", #category
+    "馬番",
     "騎手の勝率",
-    "騎手1", #category
-    "騎手2", #category
-    "騎手3", #category
+    "騎手1",
+    "騎手2",
+    "騎手3",
     "オッズ1",
     "オッズ2",
     "オッズ3",
-    "馬番1", #category
-    "馬番2", #category
-    "馬番3", #category
+    "馬番1",
+    "馬番2",
+    "馬番3",
 ]
 
 category_human_bias = [
@@ -82,10 +80,9 @@ category_human_bias = [
     "騎手3",
     "馬番1",
     "馬番2",
-    "馬番3"
+    "馬番3",
 ]
 
-# 4. 【状態変化・パドック代替グループ】（馬体・調子モデル）
 group_horse_condition = [
     "体重",
     "体重変化",
@@ -101,14 +98,46 @@ group_horse_condition = [
 ]
 
 MARKET_COLS = ["オッズ", "人気"]
-POST_RACE_COLS = ["上がり", "走破時間", "通過順"]
-NON_FEATURE_COLS = ["着順", "year", "race_id", "馬"]
+POST_RACE_COLS = [
+    "上がり",
+    "走破時間",
+    "走破時間_秒",
+    "通過順",
+    "スピード指数",
+    "着差",
+    "賞金",
+]
+ID_COLS = ["着順", "year", "race_id"]
+NON_FEATURE_COLS = ID_COLS + ["券種", "組番", "払戻金"]
+PAYOUT_COLS = ["単勝払戻", "複勝払戻"]
 
 group_human_bias_no_odds = [c for c in group_human_bias if c not in MARKET_COLS]
 
+HIGH_CARD_CATEGORICAL = [
+    "馬",
+    "horse_id",
+    "jockey_id",
+    "trainer_id",
+    "父",
+    "母父",
+    "調教師",
+    "馬主",
+    "レース名",
+]
+
 ALL_CATEGORICAL = sorted(
-    set(category_horse_ability + category_race_condition + category_human_bias)
-    | {"レース名", "開催", "場名", "騎手4", "騎手5"}
+    (
+        set(category_horse_ability + category_race_condition + category_human_bias)
+        | {
+            "開催",
+            "場名",
+            "騎手4",
+            "騎手5",
+            "距離帯",
+            "枠番",
+        }
+    )
+    - set(HIGH_CARD_CATEGORICAL)
 )
 
 
@@ -125,7 +154,7 @@ def view_columns(view, include_odds=True):
 
 
 def full_feature_columns(df, include_odds=True):
-    drop = set(NON_FEATURE_COLS) | set(POST_RACE_COLS)
+    drop = set(NON_FEATURE_COLS) | set(POST_RACE_COLS) | set(PAYOUT_COLS)
     if not include_odds:
         drop.update(MARKET_COLS)
     return [c for c in df.columns if c not in drop]
@@ -136,6 +165,7 @@ def select_features(df, view, include_odds=True):
         cols = full_feature_columns(df, include_odds=include_odds)
     else:
         cols = view_columns(view, include_odds=include_odds)
+        cols = [c for c in cols if c in df.columns]
     return df[cols]
 
 
@@ -143,3 +173,6 @@ def categorical_for_columns(columns):
     return [c for c in ALL_CATEGORICAL if c in set(columns)]
 
 
+def catboost_categorical_for_columns(columns):
+    cols = set(columns)
+    return [c for c in ALL_CATEGORICAL + HIGH_CARD_CATEGORICAL if c in cols]
