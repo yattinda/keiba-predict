@@ -29,6 +29,7 @@ htmlcov/
 Thumbs.db
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 
@@ -50,4 +51,3 @@ model/**/*.pkl
 model/**/*.zip
 model/**/*.pt
 model/**/*.pth
-model/stacking/*.csv
