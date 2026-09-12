@@ -1,88 +1,86 @@
 # keiba-predict
 
-機械学習で **3着以内に入る確率** を予測するプロジェクトです。4観点の LightGBM を OOF スタッキングし、全特徴 LightGBM をベースラインとして比較します。
+芝レースの **勝率 / 3着以内確率** を推定し、市場オッズと統合して **ROI** を評価するプロジェクトです。
+
+市場情報は Stage1 の特徴量には入れず、Stage3 でベンチマークとして結合します。
 
 ## 概要
 
 | 項目 | 内容 |
 |------|------|
-| 予測タスク | 2値分類（3着以内 = 1、4着以下 = 0） |
-| 使用アルゴリズム | LightGBM（4観点 + 全特徴ベースライン）、スタッキング（OOF 確率 + Logistic Regression） |
-| 対象レース | 芝レース（データ前処理時にフィルタ） |
-| 学習データ | 2011〜2023年（約31万行） |
-| テストデータ | 2024年（約1万行） |
+| 最終目的 | 単勝の期待値・ROI（控除率を超えるか） |
+| 中間タスク | 単勝確率（レース内 softmax）と 3着以内確率 |
+| Stage1 | 市場情報なしの全特徴: LightGBM binary / LambdaRank / スピード指数回帰、CatBoost binary、レース単位 Transformer |
+| Stage2 | レース内正規化メタ（浅い LightGBM または LR） |
+| Stage3 | longshot 補正 + 条件付きロジット + Isotonic + EV 閾値 + fractional Kelly |
+| 対象レース | 芝（近走にはダート・障害を残す） |
+| 検証 | 年単位 walk-forward（ベース / メタ / キャリブレーション / ROI テスト） |
 
 ## アーキテクチャ
 
-4つの観点ごとに LightGBM を学習し、時系列 CV の OOF 確率をロジスティック回帰で結合します。同じ特徴に CatBoost を重ねず、全特徴 LightGBM をベースラインとして比較します。
-
 ```mermaid
 flowchart TB
-    subgraph input [入力データ]
-        D[encoded CSV]
+    subgraph s0 [Stage0 データ基盤]
+        RAW[NetKeiba raw CSV]
+        FE[特徴量エンジニアリング]
+        RAW --> FE
     end
 
-    subgraph submodels [サブモデル]
-        HA[LightGBM 馬の能力]
-        RC[LightGBM レース条件]
-        HB[LightGBM 人間・オッズ]
-        HC[LightGBM 馬体・調子]
-        FULL[LightGBM 全特徴]
+    subgraph s1 [Stage1 ファンダメンタル 市場情報なし]
+        A[LightGBM binary top3]
+        B[LightGBM LambdaRank]
+        C[LightGBM スピード指数]
+        D[CatBoost binary]
+        E[Race softmax NN]
     end
 
-    subgraph meta [メタモデル]
-        M[LogisticRegression]
+    subgraph s2 [Stage2 メタ]
+        M[浅い LightGBM または LR]
     end
 
-    D --> HA & RC & HB & HC & FULL
-    HA & RC & HB & HC --> M
-    M --> P[3着以内の予測確率]
-    FULL --> B[ベースライン比較]
+    subgraph s3 [Stage3 市場統合]
+        CL[条件付きロジット]
+        CAL[Isotonic]
+        BET[EV と fractional Kelly]
+    end
+
+    FE --> A & B & C & D & E
+    A & B & C & D & E --> M
+    M --> CL --> CAL --> BET
 ```
 
-### サブモデルの特徴量グループ
-
-| モデル | 観点 | 主な特徴量 |
-|--------|------|-----------|
-| `horse_ability` | 馬の能力 | 性・齢、過去3走の着順・クラス・上がり、平均斤量、日付差 |
-| `race_condition` | レース条件適性 | 芝/ダ、距離、回り、馬場、天気、場、距離差、過去の条件 |
-| `human_bias` | 人間・オッズ | 騎手、オッズ、人気、馬番、騎手勝率、過去のオッズ・騎手 |
-| `horse_condition` | 馬体・調子 | 体重・体重変化、過去3走の通過順 |
-
-特徴量の定義は [`train/column_select.py`](train/column_select.py) を参照してください。
+特徴量の除外列（着順・走破時間などレース後情報、学習時のオッズ）は [`train/column_select.py`](train/column_select.py) を参照してください。
 
 ## ディレクトリ構成
 
 ```
 keiba-predict/
 ├── datasets/
-│   ├── data_process.py      # 生データの前処理・特徴量エンジニアリング
-│   ├── raw_data/            # 生データ CSV（ローカル配置、Git 非管理）
-│   └── encoded/             # 前処理済み CSV と preprocess_meta.pkl
+│   ├── data_process.py      # 前処理・スピード指数・相対特徴・expanding 集計
+│   ├── raw_data/            # {year}.csv と任意の {year}_payouts.csv
+│   └── encoded/             # encoded_all.csv / train / test / preprocess_meta.pkl
 ├── train/
-│   ├── column_select.py     # 特徴量グループ定義
-│   ├── train_utils.py       # 時系列 CV・LightGBM 学習
-│   ├── metrics.py           # 馬単位・レース単位の評価
-│   ├── stacking_model.py    # スタッキングメタモデル
-│   └── predict_with_stacking.py  # 推論スクリプト
-├── train_exam/              # 初期実験用スクリプト（TabNet, XGBoost 等）
-├── model/
-│   ├── lightgbm/            # 学習済み LightGBM モデル
-│   └── stacking/            # メタモデル・予測結果
+│   ├── train_pipeline.py    # ROI パイプライン（本番）
+│   ├── base_models.py       # Stage1 GBDT
+│   ├── race_nn.py           # Stage1-E レース NN
+│   ├── meta_model.py        # Stage2
+│   ├── market_roi.py        # Stage3
+│   ├── walk_forward.py      # 年単位分割
+│   ├── train_utils.py       # リークなし ES・時系列 split
+│   └── metrics.py
+├── model/roi/               # walk-forward 成果物
 └── requirements.txt
 ```
 
 ## セットアップ
 
 ```bash
-# Python 3.10+ 推奨
 python -m venv .venv
 source .venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
-主要な依存パッケージ: pandas, scikit-learn, lightgbm。`train_exam/` を動かす場合は catboost, xgboost, pytorch-tabnet, torch も使います。
+Python 3.10+ 推奨。主要な依存: pandas, scikit-learn, lightgbm, catboost, torch, scipy。
 
 ## 使い方
 
@@ -91,7 +89,7 @@ pip install -r requirements.txt
 ### 1. 生データの配置
 
 `datasets/raw_data/` に `{year}.csv`（SHIFT-JIS）を配置してください。
-このディレクトリは Git 管理外です。
+払戻金がある場合は `{year}_payouts.csv`（scraper が出力）も同じディレクトリへ。
 
 ### 2. データ前処理
 
@@ -99,73 +97,38 @@ pip install -r requirements.txt
 python datasets/data_process.py
 ```
 
-`data_process.py` では以下を行います:
-
-- 2011〜2024 年をまとめて処理し、近走特徴が年をまたげるようにする
-- 走破時間の標準化パラメータは train（year <= 2023）だけで推定
-- 日付は 2010-01-01 からの日数
-- 騎手勝率は当該レースより前の成績のみ
-- カテゴリ encoders は train で fit（未知カテゴリは専用コード）
-- `encoded_traindata.csv` と `encoded_testdata.csv` を同時に出力
+- 全馬場を読み、近走を作ったあとに芝へ絞る
+- スピード指数は距離 × 場id × 馬場の z-score（train 期間だけで fit）
+- 頭数、レース内相対特徴、リークなし expanding 成績を付与
+- `encoded_all.csv` / `encoded_traindata.csv` / `encoded_testdata.csv` を出力
 
 `--year-start` / `--year-end` / `--train-year-end` で対象年を変更できます。
 
-### 3. スタッキング学習・評価
-
-観点モデルの OOF 学習、ロジスティックメタ、全特徴ベースライン、2024 テスト評価を一括で行います。
+### 3. ROI パイプライン
 
 ```bash
-python train/stacking_model.py --train --predict
-python train/stacking_model.py --train --predict --ablation   # オッズ・人気あり/なし
-python train/stacking_model.py --train --predict --no-odds     # 市場情報なしのみ
+python train/train_pipeline.py --train --predict
+python train/train_pipeline.py --train --predict --skip-nn          # NN なし
+python train/train_pipeline.py --train --predict --max-windows 1    # 直近1ウィンドウ
 ```
 
-- メタモデル: `./model/stacking/meta_model.pkl`
-- 比較表: `./model/stacking/comparison.csv`（AUC, logloss, Brier, レース単位 precision@3 / recall@3, 1着的中）
-- 予測結果: `./model/stacking/predictions.csv`
+既定の walk-forward は 6年ベース + 3年メタ + 1年キャリブレーション + 1年 ROI テストを1年ずつスライドします。
 
-### 4. 任意データへの推論
-
-```bash
-python train/predict_with_stacking.py \
-  --input ./datasets/encoded/encoded_testdata.csv \
-  --output ./model/stacking/predictions.csv
-```
-
-オッズなしモデルを使う場合は `--no-odds` を付けます。
-
-入力 CSV は `encoded_traindata.csv` と同じカラム構成である必要があります。
-
-## データパイプライン詳細
-
-```
-raw_data/{year}.csv        # ローカル配置、SHIFT-JIS
-    ↓ data_process.py
-encoded/encoded_*.csv      # ラベルエンコード済み、近5走特徴量付き
-    ↓ train/stacking_model.py
-model/lightgbm/*.pkl
-    ↓
-model/stacking/meta_model.pkl
-    ↓ predict
-model/stacking/predictions.csv
-```
-
-### 生データのカラム
-
-race_id, 馬, 騎手, 馬番, 走破時間, オッズ, 通過順, 着順, 体重, 体重変化, 性, 齢, 斤量, 上がり, 人気, レース名, 日付, 開催, クラス, 芝・ダート, 距離, 回り, 馬場, 天気, 場id, 場名
+- 比較表: `./model/roi/walk_forward_metrics.csv`（ROI とブートストラップ区間、AUC 等）
+- 各ウィンドウ: `./model/roi/test_YYYY/`（予測、ベット明細、モデル）
 
 ## 評価指標
 
-- 馬単位: AUC、logloss、Brier score
-- レース単位: 予測上位3頭の precision@3 / recall@3、予測1位の1着的中率
-- 閾値 0.5 の混同行列には依存しない
+- 意思決定: 単勝 ROI（ブートストラップ 5–95%）、ベット数、的中率
+- 診断: AUC、logloss、Brier、precision@3 / recall@3、1着的中率
+- Stage3 の `w_model` が大きいほど、ファンダメンタルが市場に上乗せしている
 
 ## 注意事項
 
-- 生データ CSV はリポジトリに含まれません。`datasets/raw_data/` をローカルで用意してください
-- ベースモデルはレース単位の時系列 CV で OOF 予測し、メタモデルはその OOF だけで学習します
-- 推論時に使用する特徴量（オッズ・人気・走破時間等）は、実際の馬券購入タイミングで利用可能かどうかを確認してください
-- `train_exam/` は TabNet・XGBoost など初期実験用のスクリプトで、本番パイプラインとは独立しています
+- 生データ CSV はリポジトリに含まれません
+- Stage1 は現レースのオッズ・人気を使いません。オッズは Stage3 の市場確率にだけ使います
+- 走破時間・上がり・通過順・今走スピード指数はリークになるため特徴から除外します
+- ROI がプラスになることは保証しません。控除率 20〜25% を超えるかは `w_model` と walk-forward ROI で判断してください
 
 ## ライセンス
 
