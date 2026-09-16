@@ -412,9 +412,9 @@ def apply_encoders(df, encoders):
 
 def main():
     parser = argparse.ArgumentParser(description="レースデータの前処理")
-    parser.add_argument("--year-start", type=int, default=2011)
-    parser.add_argument("--year-end", type=int, default=2024)
-    parser.add_argument("--train-year-end", type=int, default=2023)
+    parser.add_argument("--year-start", type=int, default=2015)
+    parser.add_argument("--year-end", type=int, default=2025)
+    parser.add_argument("--train-year-end", type=int, default=2024)
     args = parser.parse_args()
 
     dirname = os.path.dirname(__file__)
