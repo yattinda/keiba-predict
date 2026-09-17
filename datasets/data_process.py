@@ -163,13 +163,32 @@ def load_raw(dirname, year_start, year_end):
     print("ファイル取得：開始")
     for year in range(year_start, year_end + 1):
         path = os.path.join(dirname, "raw_data", f"{year}.csv")
+        if not os.path.isfile(path):
+            print(f"  skip {year}: ファイルなし ({path})")
+            continue
         data = pd.read_csv(path, encoding="SHIFT-JIS", header=0)
-        data["日付"] = pd.to_datetime(data["日付"], format="%Y年%m月%d日")
+        if data.empty:
+            print(f"  skip {year}: ヘッダーのみ / 0 行")
+            continue
+        parsed_dates = pd.to_datetime(data["日付"], format="%Y年%m月%d日", errors="coerce")
+        bad_dates = int(parsed_dates.isna().sum())
+        if bad_dates:
+            print(f"  warn {year}: 日付パース失敗 {bad_dates} 行")
+        data["日付"] = parsed_dates
         data["着順"] = pd.to_numeric(data["着順"], errors="coerce")
-        data = data.dropna(subset=["着順"])
+        data = data.dropna(subset=["着順", "日付"])
+        if data.empty:
+            print(f"  skip {year}: 着順または日付が有効な行がない")
+            continue
         data["着順"] = data["着順"].astype(int)
+        print(f"  {year}: {len(data)} 行")
         frames.append(data)
     print("ファイル取得：完了")
+    if not frames:
+        raise SystemExit(
+            f"有効な raw CSV がありません。{year_start}–{year_end} を "
+            "keiba-scraper で取り直してください。"
+        )
     return pd.concat(frames, ignore_index=True)
 
 
@@ -431,11 +450,20 @@ def main():
 
     df["クラス"] = df["クラス"].apply(class_mapping)
     df["性"] = df["性"].map({"牡": 0, "牝": 1, "セ": 2})
-    df["芝・ダート"] = df["芝・ダート"].map({"芝": 0, "ダ": 1, "障": 2})
+    surface_raw = df["芝・ダート"].astype(str).str.strip()
+    print("芝・ダート 分布:")
+    print(surface_raw.value_counts(dropna=False).head(20).to_string())
+    df["芝・ダート"] = surface_raw.map({"芝": 0, "ダ": 1, "障": 2})
     df["回り"] = df["回り"].map({"右": 0, "左": 1, "芝": 2, "直": 2})
     df["馬場"] = df["馬場"].map({"良": 0, "稍": 1, "重": 2, "不": 3})
     df["天気"] = df["天気"].map({"晴": 0, "曇": 1, "小": 2, "雨": 3, "雪": 4})
     df["頭数"] = df.groupby("race_id")["馬番"].transform("size")
+    turf_n = int((df["芝・ダート"] == 0).sum())
+    if turf_n == 0:
+        raise SystemExit(
+            "芝レースが 0 行です。raw CSV の『芝・ダート』が "
+            "芝/ダ/障 になっていません。keiba-scraper を更新して取り直してください。"
+        )
     print("データ変換：完了")
 
     print("スピード指数：開始")
