@@ -40,6 +40,8 @@ slurm/
 # Raw race data (ローカル保管のみ、Git には含めない)
 datasets/raw_data/*
 !datasets/raw_data/.gitkeep
+datasets/raw_data/.partial_*
+datasets/raw_data/.scrape_checkpoint_*.json
 
 # Generated datasets (data_process.py で再生成可能)
 encoded_*.csv
