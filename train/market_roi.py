@@ -3,58 +3,16 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from sklearn.isotonic import IsotonicRegression
 
+from race_logit import apply_race_softmax, fit_race_softmax
 from train_utils import softmax_by_race
 
 
 def market_probs(odds, race_id):
-    inv = 1.0 / np.clip(pd.to_numeric(odds, errors="coerce").to_numpy(), 1.01, None)
+    raw = pd.to_numeric(odds, errors="coerce")
+    inv = 1.0 / np.clip(np.asarray(raw, dtype=float), 1.01, None)
     grouped = pd.Series(inv).groupby(np.asarray(race_id), sort=False)
     return (pd.Series(inv) / grouped.transform("sum")).to_numpy()
-
-
-class _LinearSoftmax:
-    def __init__(self, coef):
-        self.coef_ = np.asarray(coef, dtype=float).reshape(1, -1)
-
-    def decision_function(self, x):
-        w = self.coef_.ravel()
-        return np.asarray(x, dtype=float) @ w
-
-
-def _fit_race_softmax(features, y_win, race_id, x0=None):
-    features = np.asarray(features, dtype=float)
-    y_win = np.asarray(y_win).astype(int)
-    race_id = np.asarray(race_id)
-    win_idx = np.where(y_win == 1)[0]
-    if len(win_idx) == 0:
-        weights = np.ones(features.shape[1], dtype=float) if x0 is None else np.asarray(x0)
-        model = _LinearSoftmax(weights)
-        return model, softmax_by_race(features @ model.coef_.ravel(), race_id)
-    if x0 is None:
-        x0 = np.ones(features.shape[1], dtype=float)
-
-    def loss(w):
-        raw = features @ w
-        p = softmax_by_race(raw, race_id)
-        return -np.mean(np.log(np.clip(p[win_idx], 1e-12, 1)))
-
-    result = minimize(loss, x0=x0, method="L-BFGS-B")
-    weights = result.x
-    raw = features @ weights
-    return _LinearSoftmax(weights), softmax_by_race(raw, race_id)
-
-
-def fit_longshot_bias(p_market, y_win, race_id):
-    x = np.log(np.clip(p_market, 1e-6, 1)).reshape(-1, 1)
-    return _fit_race_softmax(x, y_win, race_id, x0=np.array([1.0]))
-
-
-def apply_longshot_bias(model, p_market, race_id):
-    x = np.log(np.clip(p_market, 1e-6, 1)).reshape(-1, 1)
-    raw = model.decision_function(x)
-    return softmax_by_race(raw, race_id)
 
 
 def fit_conditional_logit(p_model, p_market, y_win, race_id):
@@ -65,7 +23,16 @@ def fit_conditional_logit(p_model, p_market, y_win, race_id):
             np.log(np.clip(p_market, eps, 1)),
         ]
     )
-    return _fit_race_softmax(x, y_win, race_id, x0=np.array([1.0, 1.0]))
+    bounds = [(0.0, None), (0.0, None)]
+    return fit_race_softmax(
+        x,
+        y_win,
+        race_id,
+        x0=np.array([0.5, 1.0]),
+        bounds=bounds,
+        l2_target=np.array([0.0, 1.0]),
+        l2_coef=1e-2,
+    )
 
 
 def apply_conditional_logit(model, p_model, p_market, race_id):
@@ -76,8 +43,7 @@ def apply_conditional_logit(model, p_model, p_market, race_id):
             np.log(np.clip(p_market, eps, 1)),
         ]
     )
-    raw = model.decision_function(x)
-    return softmax_by_race(raw, race_id), model.coef_.ravel()
+    return apply_race_softmax(model, x, race_id)
 
 
 def harville_ordered(p_win, order):
@@ -93,28 +59,71 @@ def harville_ordered(p_win, order):
     return float(prob)
 
 
-def fit_isotonic(p, y):
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    iso.fit(p, y)
-    return iso
-
-
 def expected_value(p, odds):
-    return p * pd.to_numeric(odds, errors="coerce").to_numpy() - 1.0
+    o = pd.to_numeric(odds, errors="coerce")
+    if isinstance(o, pd.Series):
+        o = o.to_numpy()
+    else:
+        o = np.asarray(o, dtype=float)
+    return np.asarray(p, dtype=float) * o - 1.0
 
 
-def fractional_kelly(p, odds, fraction=0.25):
-    b = np.clip(pd.to_numeric(odds, errors="coerce").to_numpy() - 1.0, 1e-6, None)
-    q = 1.0 - p
-    f = (p * b - q) / b
-    return np.clip(fraction * f, 0.0, 0.05)
+def _solve_exclusive_kelly(p, odds, candidates, kelly_fraction=0.25, max_race_stake=0.05):
+    p = np.asarray(p, dtype=float)
+    odds = np.asarray(odds, dtype=float)
+    n = len(p)
+    x0 = np.zeros(n)
+
+    def objective(f):
+        total = f.sum()
+        wealth = 1.0 - total + f * odds
+        if np.any(wealth <= 1e-9):
+            return 1e6
+        return -np.sum(p * np.log(wealth))
+
+    bounds = []
+    for i in range(n):
+        if candidates[i]:
+            bounds.append((0.0, 0.2))
+        else:
+            bounds.append((0.0, 0.0))
+    constraints = [{"type": "ineq", "fun": lambda f: 0.2 - f.sum()}]
+    try:
+        res = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints)
+        if not res.success:
+            return np.zeros(n)
+        f = np.clip(res.x, 0.0, None) * kelly_fraction
+        total = f.sum()
+        if total > max_race_stake and total > 0:
+            f = f * (max_race_stake / total)
+        wealth = 1.0 - f.sum() + f * odds
+        if np.any(wealth <= 1e-9):
+            return np.zeros(n)
+        return f
+    except Exception:
+        return np.zeros(n)
 
 
-def select_bets(p, odds, ev_threshold=0.05, kelly_fraction=0.25):
+def select_bets(p, odds, race_id, ev_threshold=0.05, kelly_fraction=0.25):
+    p = np.asarray(p, dtype=float)
+    odds = np.asarray(odds, dtype=float)
+    race_id = np.asarray(race_id)
     ev = expected_value(p, odds)
-    stake = fractional_kelly(p, odds, fraction=kelly_fraction)
-    take = ev > ev_threshold
-    stake = np.where(take, stake, 0.0)
+    stake = np.zeros(len(p), dtype=float)
+    for rid in np.unique(race_id):
+        mask = race_id == rid
+        idx = np.where(mask)[0]
+        ev_r = ev[mask]
+        candidates = ev_r > ev_threshold
+        if not candidates.any():
+            continue
+        stake[mask] = _solve_exclusive_kelly(
+            p[mask],
+            odds[mask],
+            candidates,
+            kelly_fraction=kelly_fraction,
+            max_race_stake=0.05,
+        )
     return ev, stake
 
 
@@ -209,40 +218,69 @@ def bootstrap_roi(bets, n_boot=1000, random_state=42):
     }
 
 
+def split_calibration_races(calib_df, train_frac=0.75):
+    races = (
+        calib_df[["race_id", "日付"]]
+        .drop_duplicates()
+        .sort_values(["日付", "race_id"])
+        .reset_index(drop=True)
+    )
+    n_train = max(1, int(len(races) * train_frac))
+    train_races = set(races.iloc[:n_train]["race_id"])
+    val_races = set(races.iloc[n_train:]["race_id"])
+    train_mask = calib_df["race_id"].isin(train_races)
+    val_mask = calib_df["race_id"].isin(val_races)
+    return calib_df.loc[train_mask], calib_df.loc[val_mask]
+
+
+def pick_ev_threshold(market, calib_tail, p_model, min_bets=30, fallback=0.05):
+    y_win = (pd.to_numeric(calib_tail["着順"], errors="coerce") == 1).astype(int)
+    p_final, _ = market.predict(calib_tail, p_model)
+    grid = [0.0, 0.02, 0.05, 0.10, 0.15]
+    best = fallback
+    best_roi = float("-inf")
+    for thresh in grid:
+        market.ev_threshold = thresh
+        bets = market.bets(calib_tail, p_final, payouts=None)
+        live = bets[bets["stake"] > 0]
+        if len(live) < min_bets:
+            continue
+        roi = float(live["profit"].sum() / live["stake"].sum())
+        if roi > best_roi:
+            best_roi = roi
+            best = thresh
+    fallback_flag = int(best == fallback and best_roi == float("-inf"))
+    return best, fallback_flag
+
+
 class MarketIntegrator:
     def __init__(self, ev_threshold=0.05, kelly_fraction=0.25):
         self.ev_threshold = ev_threshold
         self.kelly_fraction = kelly_fraction
-        self.bias_model = None
         self.logit_model = None
-        self.isotonic = None
         self.weights_ = None
 
     def fit(self, df, p_model, y_win):
         p_mkt = market_probs(df["オッズ"], df["race_id"])
-        self.bias_model, p_mkt_adj = fit_longshot_bias(p_mkt, y_win, df["race_id"])
-        self.logit_model, p_comb = fit_conditional_logit(
-            p_model, p_mkt_adj, y_win, df["race_id"]
+        self.logit_model, _ = fit_conditional_logit(
+            p_model, p_mkt, y_win, df["race_id"].to_numpy()
         )
         self.weights_ = self.logit_model.coef_.ravel()
-        self.isotonic = fit_isotonic(p_comb, y_win)
         return self
 
     def predict(self, df, p_model):
         p_mkt = market_probs(df["オッズ"], df["race_id"])
-        p_mkt_adj = apply_longshot_bias(self.bias_model, p_mkt, df["race_id"])
-        p_comb, weights = apply_conditional_logit(
-            self.logit_model, p_model, p_mkt_adj, df["race_id"]
+        p_final, weights = apply_conditional_logit(
+            self.logit_model, p_model, p_mkt, df["race_id"].to_numpy()
         )
         self.weights_ = weights
-        p_cal = np.clip(self.isotonic.predict(p_comb), 1e-6, 1 - 1e-6)
-        p_win = softmax_by_race(np.log(p_cal), df["race_id"])
-        return p_win, p_mkt, p_mkt_adj
+        return p_final, p_mkt
 
     def bets(self, df, p_win, payouts=None):
         ev, stake = select_bets(
             p_win,
             df["オッズ"],
+            df["race_id"],
             ev_threshold=self.ev_threshold,
             kelly_fraction=self.kelly_fraction,
         )
