@@ -1,123 +1,135 @@
-"""Stage2 メタモデル。"""
+"""Stage2 メタモデル: ベース予測シェアの条件付きロジット。"""
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
-from train_utils import (
-    binary_target,
-    inner_time_split,
-    rank_by_race,
-    softmax_by_race,
-    zscore_by_race,
-)
+from race_logit import apply_race_softmax, fit_race_softmax
+from train_utils import inner_time_split, softmax_by_race
 
 
 BASE_PRED_COLS = ["lgb_binary", "lgb_rank", "lgb_speed", "cat_binary", "race_nn"]
-CONTEXT_COLS = ["頭数", "クラス", "距離帯", "馬場", "距離"]
 
 
-def add_race_normalized(meta, race_id, cols):
+def build_log_share_frame(pred_df, race_id):
     race_id = np.asarray(race_id)
-    out = meta.copy()
-    for col in cols:
-        if col not in out.columns:
+    out = pd.DataFrame(index=pred_df.index)
+    for col in BASE_PRED_COLS:
+        if col not in pred_df.columns:
             continue
-        values = out[col].to_numpy()
-        out[f"{col}_softmax"] = softmax_by_race(values, race_id)
-        out[f"{col}_z"] = zscore_by_race(values, race_id)
-        out[f"{col}_rank"] = rank_by_race(values, race_id)
-        grouped_max = (
-            pd.Series(values).groupby(race_id, sort=False).transform("max").to_numpy()
-        )
-        out[f"{col}_gap"] = values - grouped_max
+        values = pd.to_numeric(pred_df[col], errors="coerce").to_numpy()
+        share = softmax_by_race(values, race_id)
+        out[col] = np.log(np.clip(share, 1e-6, 1.0))
     return out
 
 
-def build_meta_frame(df, pred_df):
-    meta = pred_df.copy()
-    for col in CONTEXT_COLS:
-        if col in df.columns:
-            meta[col] = pd.to_numeric(df[col], errors="coerce").to_numpy()
-    pred_cols = [c for c in BASE_PRED_COLS if c in meta.columns]
-    meta = add_race_normalized(meta, df["race_id"], pred_cols)
-    return meta
-
-
-def _lgb_meta():
-    return lgb.LGBMClassifier(
-        num_leaves=31,
-        learning_rate=0.02,
-        n_estimators=400,
-        min_data_in_leaf=50,
-        random_state=42,
-        verbose=-1,
-    )
-
-
-def _lr_meta():
-    return Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            ("lr", LogisticRegression(C=1.0, max_iter=1000)),
-        ]
-    )
+def _winner_nll(p, race_id, finish):
+    finish = pd.to_numeric(finish, errors="coerce")
+    y_win = (finish == 1).astype(int).to_numpy()
+    win_idx = np.where(y_win == 1)[0]
+    if len(win_idx) == 0:
+        return float("nan")
+    p = np.clip(np.asarray(p, dtype=float), 1e-12, 1.0)
+    return float(-np.mean(np.log(p[win_idx])))
 
 
 class MetaModel:
     def __init__(self):
-        self.lgb = None
-        self.lr = None
-        self.chosen = "lgb"
+        self.model = None
+        self.chosen = "stack"
         self.feature_cols_ = None
+        self.base_only_col_ = None
+
+    def _features(self, pred_df, race_id):
+        frame = build_log_share_frame(pred_df, race_id)
+        return frame, list(frame.columns)
 
     def fit(self, df, pred_df):
-        meta = build_meta_frame(df, pred_df)
-        y = pd.Series(binary_target(df["着順"]), index=df.index)
-        inner_train, inner_val = inner_time_split(df, df.index)
-        X = meta.fillna(0)
-        self.feature_cols_ = list(X.columns)
-        self.lgb = _lgb_meta()
-        self.lr = _lr_meta()
-        self.lgb.fit(X.loc[inner_train], y.loc[inner_train])
-        self.lr.fit(X.loc[inner_train], y.loc[inner_train])
-        if inner_val is not None and len(inner_val):
-            from sklearn.metrics import log_loss
+        race_id = df["race_id"].to_numpy()
+        finish = df["着順"]
+        features, cols = self._features(pred_df, race_id)
+        if not cols:
+            raise ValueError("メタモデル: ベース予測列がありません")
+        X = features[cols].fillna(np.log(1e-6)).to_numpy()
+        y_win = (pd.to_numeric(finish, errors="coerce") == 1).astype(int).to_numpy()
 
-            p_lgb = self.lgb.predict_proba(X.loc[inner_val])[:, 1]
-            p_lr = self.lr.predict_proba(X.loc[inner_val])[:, 1]
-            yv = y.loc[inner_val]
-            ll_lgb = log_loss(yv, np.clip(p_lgb, 1e-6, 1 - 1e-6), labels=[0, 1])
-            ll_lr = log_loss(yv, np.clip(p_lr, 1e-6, 1 - 1e-6), labels=[0, 1])
-            self.chosen = "lgb" if ll_lgb <= ll_lr else "lr"
+        n_feat = X.shape[1]
+        bounds = [(0.0, None)] * n_feat
+        inner_train, inner_val = inner_time_split(df, df.index)
+        if inner_val is not None and len(inner_val):
+            val_mask = df.index.isin(inner_val)
+            val_race = race_id[val_mask]
+            val_finish = finish.loc[inner_val]
+            val_X = X[val_mask]
+
+            stack_model, stack_p = fit_race_softmax(
+                val_X,
+                y_win[val_mask],
+                val_race,
+                x0=np.ones(n_feat),
+                bounds=bounds,
+                l2_target=np.ones(n_feat),
+                l2_coef=1e-3,
+            )
+            stack_nll = _winner_nll(stack_p, val_race, val_finish)
+
+            best_nll = stack_nll
+            best_choice = "stack"
+            for j, name in enumerate(cols):
+                raw = pd.to_numeric(pred_df.loc[inner_val, name], errors="coerce").to_numpy()
+                share = softmax_by_race(raw, val_race)
+                solo_nll = _winner_nll(share, val_race, val_finish)
+                if solo_nll < best_nll:
+                    best_nll = solo_nll
+                    best_choice = f"base:{name}"
+
+            self.chosen = best_choice
+            if best_choice.startswith("base:"):
+                self.base_only_col_ = best_choice.split(":", 1)[1]
+                w = np.zeros(n_feat)
+                w[cols.index(self.base_only_col_)] = 1.0
+                self.model = fit_race_softmax(
+                    X,
+                    y_win,
+                    race_id,
+                    x0=w,
+                    bounds=bounds,
+                    l2_target=w,
+                    l2_coef=0.0,
+                )[0]
+            else:
+                self.model, _ = fit_race_softmax(
+                    X,
+                    y_win,
+                    race_id,
+                    x0=np.ones(n_feat),
+                    bounds=bounds,
+                    l2_target=np.ones(n_feat),
+                    l2_coef=1e-3,
+                )
         else:
-            self.chosen = "lgb"
-        model = self.lgb if self.chosen == "lgb" else self.lr
-        model.fit(X, y)
+            self.chosen = "stack"
+            self.model, _ = fit_race_softmax(
+                X,
+                y_win,
+                race_id,
+                x0=np.ones(n_feat),
+                bounds=bounds,
+                l2_target=np.ones(n_feat),
+                l2_coef=1e-3,
+            )
+        self.feature_cols_ = cols
         return self
 
-    def _raw(self, df, pred_df):
-        meta = build_meta_frame(df, pred_df).fillna(0)
-        for col in self.feature_cols_:
-            if col not in meta.columns:
-                meta[col] = 0
-        X = meta[self.feature_cols_]
-        model = self.lgb if self.chosen == "lgb" else self.lr
-        return model.predict_proba(X)[:, 1]
-
     def predict(self, df, pred_df):
-        raw = self._raw(df, pred_df)
         race_id = df["race_id"].to_numpy()
-        win = softmax_by_race(raw, race_id)
-        if "頭数" in df.columns:
-            field = pd.to_numeric(df["頭数"], errors="coerce").to_numpy()
-        else:
-            field = df.groupby("race_id")["race_id"].transform("size").to_numpy()
-        field = np.where(np.isnan(field), 3, field)
-        top3 = win * np.clip(field, 3, None)
-        share = pd.Series(top3).groupby(race_id).transform("sum").replace(0, np.nan)
-        top3 = np.clip(top3 * (3.0 / share), 0, 1)
-        return pd.DataFrame({"p_win": win, "p_top3": top3, "p_raw": raw}, index=df.index)
+        features, cols = self._features(pred_df, race_id)
+        for col in self.feature_cols_:
+            if col not in features.columns:
+                features[col] = np.log(1e-6)
+        X = features[self.feature_cols_].fillna(np.log(1e-6)).to_numpy()
+        if self.base_only_col_ and self.chosen.startswith("base:"):
+            j = self.feature_cols_.index(self.base_only_col_)
+            share = softmax_by_race(X[:, j], race_id)
+            return pd.DataFrame({"p_win": share, "p_raw": share}, index=df.index)
+        p_win, _ = apply_race_softmax(self.model, X, race_id)
+        return pd.DataFrame({"p_win": p_win, "p_raw": p_win}, index=df.index)
