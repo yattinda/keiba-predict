@@ -2,7 +2,7 @@
 生レース結果を学習・推論用の encoded CSV に変換する。
 
 - 全馬場を読み、近走特徴を作ったあとに芝へ絞る（近走のダート・障害を残す）
-- スピード指数は距離 × 場id × 馬場の z-score（train 期間だけで fit）
+- スピード指数は距離 × 場id × 馬場で、当該レースより前だけの expanding z-score
 - 頭数・レース内相対特徴・リークなし expanding 集計を付与
 - 日付は固定原点 2010-01-01 からの日数
 - カテゴリ encoders は train で fit し、未知カテゴリは専用コード
@@ -202,59 +202,91 @@ def ensure_optional_columns(df):
     return df
 
 
-def fit_speed_figure_params(seconds, distance, venue, going, train_mask):
-    tmp = pd.DataFrame(
-        {
-            "seconds": seconds,
-            "距離": pd.to_numeric(distance, errors="coerce"),
-            "場id": venue,
-            "馬場": going,
-        }
-    )
-    train = tmp.loc[train_mask]
-    stats = (
-        train.groupby(["距離", "場id", "馬場"], dropna=False)["seconds"]
-        .agg(mean="mean", std="std", n="count")
-        .reset_index()
-    )
-    stats["std"] = stats["std"].fillna(1.0).replace(0, 1.0)
-    stats.loc[stats["n"] < 20, ["mean", "std"]] = pd.NA
-    global_mean = float(train["seconds"].mean())
-    global_std = float(train["seconds"].std() or 1.0)
-    return {
-        "stats": stats,
-        "global_mean": global_mean,
-        "global_std": global_std if global_std else 1.0,
-    }
+def _mean_std_from_moments(n, s, ss):
+    if n is None or n < 2 or (isinstance(n, float) and np.isnan(n)):
+        return np.nan, np.nan
+    mean = s / n
+    var = ss / n - mean * mean
+    if var <= 0:
+        return mean, np.nan
+    return mean, float(np.sqrt(var))
 
 
-def apply_speed_figure(seconds, distance, venue, going, params):
-    tmp = pd.DataFrame(
-        {
-            "seconds": seconds.to_numpy(),
-            "距離": pd.to_numeric(distance, errors="coerce").to_numpy(),
-            "場id": venue.to_numpy() if hasattr(venue, "to_numpy") else venue,
-            "馬場": going.to_numpy() if hasattr(going, "to_numpy") else going,
-        }
+def add_causal_speed_figure(df, seconds_col="走破時間_秒", min_count=20):
+    work = df.copy()
+    work["_sec"] = pd.to_numeric(work[seconds_col], errors="coerce")
+    for col in ["距離", "場id", "馬場"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.sort_values(["日付", "race_id"])
+    gcols = ["距離", "場id", "馬場"]
+
+    race_grp = (
+        work.groupby(gcols + ["日付", "race_id"], dropna=False, as_index=False)
+        .agg(g_n=("_sec", "count"), g_sum=("_sec", "sum"), g_ss=("_sec", lambda s: float((s ** 2).sum())))
     )
-    merged = tmp.merge(params["stats"], on=["距離", "場id", "馬場"], how="left")
-    mean = merged["mean"].fillna(params["global_mean"])
-    std = merged["std"].fillna(params["global_std"]).replace(0, 1.0)
-    z = -(merged["seconds"] - mean) / std
-    return z.clip(lower=-4, upper=4).to_numpy()
+    race_grp = race_grp.sort_values(gcols + ["日付", "race_id"]).reset_index(drop=True)
+    for stat in ("g_n", "g_sum", "g_ss"):
+        race_grp[f"prev_{stat}"] = (
+            race_grp.groupby(gcols, dropna=False)[stat].cumsum() - race_grp[stat]
+        )
+
+    glob_race = (
+        work.groupby(["日付", "race_id"], dropna=False, as_index=False)
+        .agg(_gn=("_sec", "count"), _gsum=("_sec", "sum"), _gss=("_sec", lambda s: float((s ** 2).sum())))
+    )
+    glob_race = glob_race.sort_values(["日付", "race_id"]).reset_index(drop=True)
+    glob_race["_prev_gn"] = glob_race["_gn"].cumsum() - glob_race["_gn"]
+    glob_race["_prev_gsum"] = glob_race["_gsum"].cumsum() - glob_race["_gsum"]
+    glob_race["_prev_gss"] = glob_race["_gss"].cumsum() - glob_race["_gss"]
+
+    work = work.merge(
+        race_grp[gcols + ["日付", "race_id", "prev_g_n", "prev_g_sum", "prev_g_ss"]],
+        on=gcols + ["日付", "race_id"],
+        how="left",
+    )
+    work = work.merge(
+        glob_race[["日付", "race_id", "_prev_gn", "_prev_gsum", "_prev_gss"]],
+        on=["日付", "race_id"],
+        how="left",
+    )
+
+    work["スピード指数"] = np.nan
+    for i in range(len(work)):
+        row = work.iloc[i]
+        idx = work.index[i]
+        n_g = row["prev_g_n"]
+        use_global = pd.isna(n_g) or n_g < min_count
+        if use_global:
+            n, s, ss = row["_prev_gn"], row["_prev_gsum"], row["_prev_gss"]
+        else:
+            n, s, ss = n_g, row["prev_g_sum"], row["prev_g_ss"]
+        mean, std = _mean_std_from_moments(n, s, ss)
+        t = row["_sec"]
+        if pd.isna(t) or pd.isna(mean) or pd.isna(std) or std == 0:
+            continue
+        work.at[idx, "スピード指数"] = np.clip(-(t - mean) / std, -4, 4)
+
+    out = df.copy()
+    out["スピード指数"] = work["スピード指数"]
+    return out
+
+
+def _past_run_entity(df):
+    if "horse_id" in df.columns and df["horse_id"].notna().any():
+        return "horse_id"
+    return "馬"
 
 
 def add_past_runs(df):
     past_features = [c for c in PAST_FEATURES if c in df.columns]
-    df = df.sort_values(by=["馬", "日付"], ascending=[True, False]).copy()
-    entity = "horse_id" if df["horse_id"].notna().any() else "馬"
+    entity = _past_run_entity(df)
+    sort_cols = [entity, "日付", "race_id"]
+    df = df.sort_values(by=sort_cols, ascending=[True, False, False]).copy()
     for i in range(1, 6):
         df[f"日付{i}"] = df.groupby(entity)["日付"].shift(-i)
         for feature in past_features:
             df[f"{feature}{i}"] = df.groupby(entity)[feature].shift(-i)
-    for feature in past_features:
-        for i in range(1, 6):
-            df[f"{feature}{i}"] = df.groupby(entity)[f"{feature}{i}"].ffill()
     df = df.groupby(["race_id", "馬"], as_index=False).last()
     return df.sort_values(by=["日付", "race_id"], ascending=True).copy()
 
@@ -429,6 +461,56 @@ def apply_encoders(df, encoders):
     return df
 
 
+def process_frame(df, train_year_end, min_speed_count=20):
+    """
+    raw 相当の DataFrame を学習用の形に変換する（CSV は書かない）。
+
+    テストやノートブックから main() と同じ変換だけを呼ぶための入口。
+    """
+    df = ensure_optional_columns(df.copy())
+    if not pd.api.types.is_datetime64_any_dtype(df["日付"]):
+        parsed = pd.to_datetime(df["日付"], format="%Y年%m月%d日", errors="coerce")
+        if parsed.isna().all():
+            parsed = pd.to_datetime(df["日付"], errors="coerce")
+        df["日付"] = parsed
+
+    seconds = parse_race_time_seconds(df["走破時間"])
+    df["走破時間_秒"] = seconds
+    df["着差"] = parse_margin(df["着差"]) if "着差" in df.columns else np.nan
+
+    if "通過順" in df.columns:
+        pas = df["通過順"].astype(str).str.split("-", expand=True)
+        df["通過順"] = pas.apply(lambda col: pd.to_numeric(col, errors="coerce")).mean(axis=1)
+
+    df["クラス"] = df["クラス"].apply(class_mapping)
+    df["性"] = df["性"].map({"牡": 0, "牝": 1, "セ": 2})
+    surface_raw = df["芝・ダート"].astype(str).str.strip()
+    df["芝・ダート"] = surface_raw.map({"芝": 0, "ダ": 1, "障": 2})
+    df["回り"] = df["回り"].map({"右": 0, "左": 1, "芝": 2, "直": 2})
+    df["馬場"] = df["馬場"].map({"良": 0, "稍": 1, "重": 2, "不": 3})
+    df["天気"] = df["天気"].map({"晴": 0, "曇": 1, "小": 2, "雨": 3, "雪": 4})
+    df["頭数"] = df.groupby("race_id")["馬番"].transform("size")
+    if int((df["芝・ダート"] == 0).sum()) == 0:
+        raise ValueError(
+            "芝レースが 0 行です。『芝・ダート』は 芝/ダ/障 のいずれかである必要があります。"
+        )
+
+    df = add_causal_speed_figure(df, seconds_col="走破時間_秒", min_count=min_speed_count)
+    df = add_past_runs(df)
+    df = df[df["芝・ダート"] == 0].copy()
+    df = df.replace("---", np.nan)
+    df = add_diffs_and_weight(df)
+    df = add_jockey_win_rate(df)
+    df = add_expanding_form_stats(df)
+    df = add_relative_features(df)
+    df = dates_to_ordinal(df)
+
+    train_mask = df["year"] <= train_year_end
+    encoders = fit_encoders(df.loc[train_mask])
+    df = apply_encoders(df, encoders)
+    return df, encoders
+
+
 def main():
     parser = argparse.ArgumentParser(description="レースデータの前処理")
     parser.add_argument("--year-start", type=int, default=2015)
@@ -438,65 +520,18 @@ def main():
 
     dirname = os.path.dirname(__file__)
     df = load_raw(dirname, args.year_start, args.year_end)
-    df = ensure_optional_columns(df)
-
-    print("データ変換：開始")
-    seconds = parse_race_time_seconds(df["走破時間"])
-    df["走破時間_秒"] = seconds
-    df["着差"] = parse_margin(df["着差"]) if "着差" in df.columns else np.nan
-
-    pas = df["通過順"].astype(str).str.split("-", expand=True)
-    df["通過順"] = pas.apply(lambda col: pd.to_numeric(col, errors="coerce")).mean(axis=1)
-
-    df["クラス"] = df["クラス"].apply(class_mapping)
-    df["性"] = df["性"].map({"牡": 0, "牝": 1, "セ": 2})
     surface_raw = df["芝・ダート"].astype(str).str.strip()
     print("芝・ダート 分布:")
     print(surface_raw.value_counts(dropna=False).head(20).to_string())
-    df["芝・ダート"] = surface_raw.map({"芝": 0, "ダ": 1, "障": 2})
-    df["回り"] = df["回り"].map({"右": 0, "左": 1, "芝": 2, "直": 2})
-    df["馬場"] = df["馬場"].map({"良": 0, "稍": 1, "重": 2, "不": 3})
-    df["天気"] = df["天気"].map({"晴": 0, "曇": 1, "小": 2, "雨": 3, "雪": 4})
-    df["頭数"] = df.groupby("race_id")["馬番"].transform("size")
-    turf_n = int((df["芝・ダート"] == 0).sum())
-    if turf_n == 0:
-        raise SystemExit(
-            "芝レースが 0 行です。raw CSV の『芝・ダート』が "
-            "芝/ダ/障 になっていません。keiba-scraper を更新して取り直してください。"
-        )
-    print("データ変換：完了")
 
-    print("スピード指数：開始")
-    train_mask_time = df["日付"].dt.year <= args.train_year_end
-    speed_params = fit_speed_figure_params(
-        seconds, df["距離"], df["場id"], df["馬場"], train_mask_time
-    )
-    df["スピード指数"] = apply_speed_figure(
-        seconds, df["距離"], df["場id"], df["馬場"], speed_params
-    )
-    df["走破時間"] = df["スピード指数"]
-    print("スピード指数：完了")
-
-    print("近5走取得：開始")
-    df = add_past_runs(df)
-    print("近5走取得：終了")
-
-    df = df[df["芝・ダート"] == 0].copy()
-
-    df = df.replace("---", np.nan)
-    print("日付変換：開始")
-    df = add_diffs_and_weight(df)
-    df = add_jockey_win_rate(df)
-    df = add_expanding_form_stats(df)
-    df = add_relative_features(df)
-    df = dates_to_ordinal(df)
-    print("日付変換：終了")
+    print("データ変換〜エンコーディング：開始")
+    try:
+        df, encoders = process_frame(df, args.train_year_end, min_speed_count=20)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print("データ変換〜エンコーディング：完了")
 
     train_mask = df["year"] <= args.train_year_end
-    print("エンコーディング：開始")
-    encoders = fit_encoders(df.loc[train_mask])
-    df = apply_encoders(df, encoders)
-    print("エンコーディング：終了")
 
     encoded_dir = os.path.join(dirname, "encoded")
     os.makedirs(encoded_dir, exist_ok=True)
@@ -510,11 +545,7 @@ def main():
     test_df.to_csv(test_path, index=False)
 
     meta = {
-        "speed_params": {
-            "stats": speed_params["stats"].to_dict(orient="list"),
-            "global_mean": speed_params["global_mean"],
-            "global_std": speed_params["global_std"],
-        },
+        "speed_figure": {"method": "causal_expanding", "min_count": 20},
         "encoders": encoders,
         "date_origin": str(DATE_ORIGIN.date()),
         "train_year_end": args.train_year_end,
