@@ -19,10 +19,15 @@ sys.path.insert(0, TRAIN_DIR)
 
 import metrics
 from base_models import FundamentalModels
-from market_roi import MarketIntegrator, bootstrap_roi, roi_summary
+from market_roi import (
+    MarketIntegrator,
+    bootstrap_roi,
+    pick_ev_threshold,
+    roi_summary,
+    split_calibration_races,
+)
 from meta_model import MetaModel
 from race_nn import RaceSoftmaxModel
-from train_utils import binary_target
 from walk_forward import mask_years, walk_forward_windows
 
 
@@ -129,47 +134,48 @@ def run_window(df, window, skip_nn, skip_cat, ev_threshold, kelly_fraction):
     print("  Stage3 市場統合 / キャリブレーション...")
     calib_pred = _predict_bases(base, race_nn, calib_df, skip_nn)
     calib_meta = meta.predict(calib_df, calib_pred)
-    y_win = (pd.to_numeric(calib_df["着順"], errors="coerce") == 1).astype(int)
+    calib_head, calib_tail = split_calibration_races(calib_df)
+    y_win_head = (pd.to_numeric(calib_head["着順"], errors="coerce") == 1).astype(int)
     market = MarketIntegrator(ev_threshold=ev_threshold, kelly_fraction=kelly_fraction)
-    market.fit(calib_df, calib_meta["p_win"].to_numpy(), y_win.to_numpy())
+    market.fit(calib_head, calib_meta.loc[calib_head.index, "p_win"].to_numpy(), y_win_head.to_numpy())
+    chosen_thr, threshold_fallback = pick_ev_threshold(
+        market,
+        calib_tail,
+        calib_meta.loc[calib_tail.index, "p_win"].to_numpy(),
+        min_bets=30,
+        fallback=ev_threshold,
+    )
+    market.ev_threshold = chosen_thr
     print(f"    logit weights w_model,w_market={market.weights_}")
+    print(f"    ev_threshold={chosen_thr} (fallback={threshold_fallback})")
 
     print("  テスト予測...")
     test_pred = _predict_bases(base, race_nn, test_df, skip_nn)
     test_meta = meta.predict(test_df, test_pred)
-    p_final, p_mkt, p_mkt_adj = market.predict(test_df, test_meta["p_win"].to_numpy())
+    p_final, p_mkt = market.predict(test_df, test_meta["p_win"].to_numpy())
     years = window["test"]
     payouts = load_payouts(years)
     bets = market.bets(test_df, p_final, payouts=payouts)
     summary = roi_summary(bets)
     boot = bootstrap_roi(bets)
-    y_top3 = binary_target(test_df["着順"])
     finish = pd.to_numeric(test_df["着順"], errors="coerce")
-    acc = metrics.evaluate_predictions(
-        y_top3,
-        test_meta["p_top3"],
-        race_id=test_df["race_id"],
-        finish=finish,
-        name="meta_top3",
-    )
-    acc_final = metrics.evaluate_predictions(
-        y_top3,
-        p_final,
-        race_id=test_df["race_id"],
-        finish=finish,
-        name="p_final_win",
-    )
+    nll_market = metrics.race_winner_nll(test_df["race_id"], p_mkt, finish)
+    nll_model = metrics.race_winner_nll(test_df["race_id"], test_meta["p_win"], finish)
+    nll_final = metrics.race_winner_nll(test_df["race_id"], p_final, finish)
     result = {
         "window": window["name"],
         "meta_backend": meta.chosen,
         "w_model": float(market.weights_[0]) if market.weights_ is not None else np.nan,
         "w_market": float(market.weights_[1]) if market.weights_ is not None else np.nan,
+        "ev_threshold": float(chosen_thr),
+        "threshold_fallback": int(threshold_fallback),
+        "nll_market": nll_market,
+        "nll_model": nll_model,
+        "nll_final": nll_final,
+        "delta_nll": float(nll_market - nll_final) if np.isfinite(nll_market) and np.isfinite(nll_final) else float("nan"),
         **{f"roi_{k}": v for k, v in summary.items()},
         **boot,
-        "auc_top3": acc["auc"],
-        "logloss_top3": acc["logloss"],
-        "race_precision_at_3": acc["race_precision_at_3"],
-        "win_hit_rate": acc_final["win_hit_rate"],
+        "win_hit_rate": metrics.win_pick_hit_rate(test_df["race_id"], p_final, finish),
     }
     out_dir = os.path.join(MODEL_DIR, window["name"])
     os.makedirs(out_dir, exist_ok=True)
@@ -189,10 +195,8 @@ def run_window(df, window, skip_nn, skip_cat, ev_threshold, kelly_fraction):
         )
     pred_out = test_df[["race_id", "馬番", "着順", "オッズ"]].copy()
     pred_out["p_win"] = test_meta["p_win"].to_numpy()
-    pred_out["p_top3"] = test_meta["p_top3"].to_numpy()
     pred_out["p_final"] = p_final
     pred_out["p_market"] = p_mkt
-    pred_out["p_market_adj"] = p_mkt_adj
     pred_out.to_csv(os.path.join(out_dir, "predictions.csv"), index=False)
     bets.to_csv(os.path.join(out_dir, "bets.csv"), index=False)
     pd.DataFrame([result]).to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
