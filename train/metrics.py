@@ -60,6 +60,40 @@ def evaluate_predictions(y_binary, pred, race_id=None, finish=None, name="model"
     return metrics
 
 
+def race_winner_nll(race_id, p, finish):
+    finish = pd.to_numeric(finish, errors="coerce")
+    y_win = (finish == 1).astype(int).to_numpy()
+    p = _clip_proba(p)
+    df = pd.DataFrame({"race_id": np.asarray(race_id), "p": p, "y": y_win})
+    losses = []
+    for _, g in df.groupby("race_id", sort=False):
+        winners = g.loc[g["y"] == 1]
+        if winners.empty:
+            continue
+        if len(winners) > 1:
+            continue
+        losses.append(-np.log(winners["p"].iloc[0]))
+    return float(np.mean(losses)) if losses else float("nan")
+
+
+def win_pick_hit_rate(race_id, p, finish):
+    finish = pd.to_numeric(finish, errors="coerce")
+    df = pd.DataFrame(
+        {
+            "race_id": np.asarray(race_id),
+            "p": np.asarray(p, dtype=float),
+            "finish": finish.to_numpy(),
+        }
+    )
+    hits = []
+    for _, g in df.groupby("race_id", sort=False):
+        if g["finish"].isna().all():
+            continue
+        top = g.loc[g["p"].idxmax()]
+        hits.append(float(top["finish"] == 1))
+    return float(np.mean(hits)) if hits else float("nan")
+
+
 def format_metrics_table(rows):
     df = pd.DataFrame(rows)
     preferred = [
