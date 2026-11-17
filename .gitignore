@@ -47,6 +47,9 @@ datasets/raw_data/.scrape_checkpoint_*.json
 encoded_*.csv
 datasets/encoded/
 
+# Local notes (not committed)
+memo.md
+
 # ML training outputs (学習スクリプトで再生成可能)
 catboost_info/
 model/**/*.pkl
