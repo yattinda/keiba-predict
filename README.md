@@ -118,6 +118,19 @@ python train/train_pipeline.py --train --predict --max-windows 1    # 直近1ウ
 - 比較表: `./model/roi/walk_forward_metrics.csv`（ROI、`delta_nll`、ブートストラップ区間 等）
 - 各ウィンドウ: `./model/roi/test_YYYY/`（予測、ベット明細、モデル）
 
+### 4. 3着以内の補助パイプライン（3連複候補の参考用）
+
+単勝パイプラインとは独立。馬ごとの **3着以内周辺確率** `p_top3` を出す（レース内合計は 1 に揃えない）。`triple_heuristics.csv` のスコアは上位馬3頭の `p` の積であり、3連複確率ではない。
+
+```bash
+python train/top3_pipeline.py --train --predict
+python train/top3_pipeline.py --train --predict --max-windows 1
+```
+
+- 出力: `./model/top3/walk_forward_metrics.csv`、各ウィンドウに `predictions.csv` / `triple_heuristics.csv`
+- 複勝オッズ列 `複勝オッズ` が encoded に無い場合、Stage3 はモデル確率のまま
+- `diagnostic_bets.csv` は頭数8以上の複勝診断用（本番の単勝ケリーとは別）
+
 ## 評価指標
 
 - 意思決定: まずテスト年の `delta_nll`（市場 NLL − 結合 NLL）が正か。次に単勝 ROI（ブートストラップ 5–95%）、ベット数
@@ -141,6 +154,7 @@ pytest tests/ -v
 | `test_splits.py` | Stage1 特徴除外・walk-forward・CV |
 | `test_market_stack.py` | 市場確率・賭金・精算 |
 | `test_meta.py` | メタ確率・指標・NN データセット |
+| `test_top3_stack.py` | top3 周辺確率・複勝診断精算・三つ組ヒューリスティック |
 
 ## 注意事項
 
